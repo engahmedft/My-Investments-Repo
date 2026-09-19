@@ -1,14 +1,14 @@
 /**
- * Class responsible for auditing formulas, data tables/islands,
+ * Static utility class responsible for auditing formulas, data tables/islands,
  * workbook structures, and repairing/unblocking ArrayFormula expansion errors.
  * Standardized on 'Formula_Audit' and 'Tables_Audit'.
  */
 class WorkbookAuditor {
   /**
-   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [spreadsheet]
+   * Prevent instantiation of purely static utility class.
    */
-  constructor(spreadsheet = SpreadsheetApp.getActiveSpreadsheet()) {
-    this.ss = spreadsheet;
+  constructor() {
+    throw new Error("WorkbookAuditor is a static utility class and cannot be instantiated.");
   }
 
   /**
@@ -181,19 +181,12 @@ class WorkbookAuditor {
   }
 
   /**
-   * Runs all workbook audits sequentially.
-   */
-  runAllAudits() {
-    this.auditFormulas("Formula_Audit");
-    this.auditTables("Tables_Audit");
-  }
-
-  /**
    * Scans all sheets for formulas and writes a consolidated report to 'Formula_Audit'.
    * @param {string} [reportName="Formula_Audit"]
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss=SpreadsheetApp.getActiveSpreadsheet()]
    */
-  auditFormulas(reportName = "Formula_Audit") {
-    const sheets = this.ss.getSheets();
+  static listAllFormulas(reportName = "Formula_Audit", ss = SpreadsheetApp.getActiveSpreadsheet()) {
+    const sheets = ss.getSheets();
     const nowTimestamp = new Date();
     const allDataToPush = [["Sheet Name", "Cell", "Formula", "Last Update"]];
 
@@ -234,7 +227,7 @@ class WorkbookAuditor {
     }
 
     WorkbookAuditor._writeReport(
-      this.ss,
+      ss,
       reportName,
       allDataToPush,
       "No formulas found in the entire workbook.",
@@ -246,9 +239,10 @@ class WorkbookAuditor {
    * Detects contiguous data "islands" (tables) across all sheets using 1D BFS in O(N) time.
    * Outputs report to 'Tables_Audit'.
    * @param {string} [reportName="Tables_Audit"]
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss=SpreadsheetApp.getActiveSpreadsheet()]
    */
-  auditTables(reportName = "Tables_Audit") {
-    const sheets = this.ss.getSheets();
+  static listAllTables(reportName = "Tables_Audit", ss = SpreadsheetApp.getActiveSpreadsheet()) {
+    const sheets = ss.getSheets();
     const nowTimestamp = new Date();
     const results = [["Sheet Name", "Header Row", "Column", "Header Name", "Last Update"]];
 
@@ -340,7 +334,7 @@ class WorkbookAuditor {
     }
 
     WorkbookAuditor._writeReport(
-      this.ss,
+      ss,
       reportName,
       results,
       "No data tables found.",
@@ -394,17 +388,23 @@ class WorkbookAuditor {
     return true;
   }
 
-  applyFormulas(auditSheetName = "Formula_Audit") {
-    const auditSheet = this.ss.getSheetByName(auditSheetName) || this.ss.getSheetByName("FormulaAudit");
+  /**
+   * Restores formulas recorded in the audit sheet back to their target cells.
+   * @param {string} [auditSheetName="Formula_Audit"]
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss=SpreadsheetApp.getActiveSpreadsheet()]
+   * @returns {{ success: boolean, total: number, applied: number, skipped: number, errors: string[] }}
+   */
+  static restoreAllFormulas(auditSheetName = "Formula_Audit", ss = SpreadsheetApp.getActiveSpreadsheet()) {
+    const auditSheet = ss.getSheetByName(auditSheetName) || ss.getSheetByName("FormulaAudit");
     if (!auditSheet) {
       const msg = `Could not find '${auditSheetName}' sheet.`;
-      this.ss.toast(msg, "Error ❌", 5);
+      ss.toast(msg, "Error ❌", 5);
       return { success: false, total: 0, applied: 0, skipped: 0, errors: [msg] };
     }
 
     const data = auditSheet.getDataRange().getValues();
     if (data.length <= 1) {
-      this.ss.toast("No records found in formula audit sheet.", "Finished ℹ️", 4);
+      ss.toast("No records found in formula audit sheet.", "Finished ℹ️", 4);
       return { success: true, total: 0, applied: 0, skipped: 0, errors: [] };
     }
 
@@ -415,7 +415,7 @@ class WorkbookAuditor {
 
     if (colSheetName === -1 || colCell === -1 || colFormula === -1) {
       const msg = "Invalid header structure in Formula_Audit. Expected 'Sheet Name', 'Cell', and 'Formula'.";
-      this.ss.toast(msg, "Error ❌", 5);
+      ss.toast(msg, "Error ❌", 5);
       return { success: false, total: 0, applied: 0, skipped: 0, errors: [msg] };
     }
 
@@ -439,7 +439,7 @@ class WorkbookAuditor {
 
       try {
         if (!sheetCache.has(targetSheetName)) {
-          sheetCache.set(targetSheetName, this.ss.getSheetByName(targetSheetName));
+          sheetCache.set(targetSheetName, ss.getSheetByName(targetSheetName));
         }
         const targetSheet = sheetCache.get(targetSheetName);
 
@@ -461,7 +461,7 @@ class WorkbookAuditor {
     SpreadsheetApp.flush();
 
     const summaryMsg = `Applied: ${applied} | Skipped: ${skipped} | Errors: ${errors.length}`;
-    this.ss.toast(summaryMsg, errors.length === 0 ? "Success ✅" : "Warning ⚠️", 6);
+    ss.toast(summaryMsg, errors.length === 0 ? "Success ✅" : "Warning ⚠️", 6);
     Logger.log(`[WorkbookAuditor] Formula Restoration Summary -> ${summaryMsg}`);
 
     return {
@@ -496,4 +496,3 @@ class WorkbookAuditor {
     return WorkbookAuditor.AUDIT_SHEET_KEYWORDS.has(normalized);
   }
 }
-
