@@ -28,7 +28,9 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
    Master static orchestrator executing the 6-stage investment portfolio synchronization:
      Stage 1: Google Finance optimization, multi-tier sorting (Market_ID first, then missing
               52-week min rows [hasNoMin], then natural alphanumeric GF_Key), parallel Yahoo
-              Finance price backfill, and timestamp formatting (Optimize_Date with full time).
+              Finance price backfill (syncing received Yahoo price and 52-week low into
+              Manual_Price and Manual_Year_Min while leaving manual values untouched if no
+              quote returns), and timestamp formatting (Optimize_Date with full time).
      Stage 2: Transaction chronological sort (Execution Date -> Trans Date -> Company -> Order Type
               -> Last Update -> Descending Avg Cost), running average cost basis calculation,
               future dividend quantity synchronization, and cross-platform dividend auto-replication.
@@ -59,8 +61,9 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
 
    - PortfolioManager.optimizeGoogleFinance(logEntries, spreadsheet):
      Targeted optimization, key computation, multi-tier sorting (Market_ID -> hasNoMin -> GF_Key),
-     timestamp formatting (Optimize_Date stamped with full time 'yyyy-mm-dd hh:mm:ss'), and Yahoo
-     Finance backfill for Google_Finance_Data.
+     timestamp formatting (Optimize_Date stamped with full time 'yyyy-mm-dd hh:mm:ss'), parallel Yahoo
+     Finance backfill, and recording incoming Yahoo price and 52-week low directly into Manual_Price
+     and Manual_Year_Min (leaving manual fields untouched if the API returns no quote).
 
    - PortfolioManager.runWithStatus(actionNameOrFn, maybeFn, spreadsheet):
      State machine wrapper logging live execution status (Running/Completed/Error) and timestamps
@@ -70,6 +73,11 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
    - Yahoo Finance quotes are requested concurrently via UrlFetchApp.fetchAll().
    - Multi-batch payloads (50 symbols/request) execute simultaneously in parallel rather than sequentially.
    - Authentication cookie and crumb are retrieved and cached for 6 hours (21,600s) via CacheService.
+   - Manual Price/Min Recording:
+     * When Yahoo returns a quote with price > 0, it is recorded into Manual_Price.
+     * When Yahoo returns a 52-week low > 0, it is recorded into Manual_Year_Min.
+     * If Yahoo returns no quote, Manual_Price and Manual_Year_Min remain unmodified, while Yahoo columns
+       are reset to empty strings.
    - Market Ticker Normalization:
      * Saudi Tadawul (Market 702 or 4-digit numeric symbols): Appends '.SR' (e.g., '1120.SR').
      * Gold Assets (symbols matching /gold/i or 'Gold.'): Mapped to COMEX Gold Futures ('GC=F').
@@ -690,7 +698,8 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
    * Optimizes the Google_Finance_Data sheet:
    * 1. Multi-tier sort: Market_ID first, then (No Google Min & No Yahoo Min), then natural alphanumeric GF_Key.
    * 2. Yahoo Finance parallel quotes backfill.
-   * 3. Explicit timestamp formatting: Stamped Optimize_Date contains full time formatted as 'yyyy-mm-dd hh:mm:ss'.
+   * 3. Syncs incoming Yahoo Price/Min to Manual Price/Min (leaves manual fields untouched if API fails).
+   * 4. Explicit timestamp formatting: Stamped Optimize_Date contains full time formatted as 'yyyy-mm-dd hh:mm:ss'.
    */
   static optimizeGoogleFinance(logEntries = null, spreadsheet = null) {
     const ss = PortfolioManager.getSpreadsheet(spreadsheet);
@@ -719,9 +728,11 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
             const symbolCol       = requireCol("Symbol");
             const manualNameCol   = requireCol("Manual_Name");
             const combinedNameCol = requireCol("Combined_Name");
+            const manualYearMinCol= requireCol("Manual_Year_Min");
             const googleMinCol    = requireCol("Google_Min");
             const yahooNameCol    = requireCol("Yahoo_Name");
             const yahooMinCol     = requireCol("Yahoo_Min");
+            const manualPriceCol  = requireCol("Manual_Price");
             const googlePriceCol  = requireCol("Google_Price");
             const yahooPriceCol   = requireCol("Yahoo_Price");
             const lastUpdateCol   = requireCol("Last_Update");
@@ -762,7 +773,6 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
               r[combinedNameCol] = computedCombinedName;
 
               if (isDirty || keyChanged || nameChanged) {
-                // Ensure Optimize_Date is stamped with full current Date instance containing time
                 r[optDateCol] = nowTimestamp;
                 if (keyChanged || nameChanged) {
                   standaloneLogs.push([
@@ -857,6 +867,13 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
                   r[yahooNameCol] = quote.name || "";
                   r[yahooMinCol] = quote.min52 > 0 ? quote.min52 : "";
                   r[yahooPriceCol] = quote.price > 0 ? quote.price : "";
+
+                  // Record incoming Yahoo values into Manual fields
+                  r[manualPriceCol] = quote.price;
+                  if (quote.min52 > 0) {
+                    r[manualYearMinCol] = quote.min52;
+                  }
+
                   r[optDateCol] = nowTimestamp;
 
                   standaloneLogs.push([
@@ -868,12 +885,14 @@ PORTFOLIO MANAGER ENGINE SPECIFICATION & ARCHITECTURE (100% STATIC)
                     target.symbol,
                     quote.name || "N/A",
                     "Yahoo API Fill",
-                    `Yahoo backfill applied: Price=${quote.price}, 52WkLow=${quote.min52}`
+                    `Yahoo backfill applied: Price=${quote.price}, 52WkLow=${quote.min52} (Manual Price/Min updated)`
                   ]);
                 } else {
+                  // Original behavior: clear Yahoo fields if quote is missing
                   r[yahooNameCol] = "";
                   r[yahooMinCol] = "";
                   r[yahooPriceCol] = "";
+                  // Manual_Price and Manual_Year_Min remain untouched
                 }
               }
             }
