@@ -25,12 +25,21 @@ const SYSTEM_CONFIG = Object.freeze({
 });
 
 const CommandEngine = {
+  /**
+   * Loads active system commands strictly via BatchProcessor.read without range fallback.
+   * Filters exclusively for Category_ID = 5 and Is_Active = 'Y'.
+   * @returns {Array<{code: string, label: string, addSeparator: boolean}>}
+   */
   loadCommands() {
-    const table = BatchProcessor.read(SYSTEM_CONFIG.SHEETS.LOOKUP, SYSTEM_CONFIG.LOOKUP.HEADER_ROW);
-    if (!table || table.length <= 1) return [];
+    const readResult = BatchProcessor.read(SYSTEM_CONFIG.SHEETS.LOOKUP, SYSTEM_CONFIG.LOOKUP.HEADER_ROW);
+    if (!readResult) return [];
 
-    const headers = table[0];
-    const getIdx = (colName) => headers.indexOf(colName.toLowerCase());
+    const headers = (readResult.headers || []).map(h => String(h ?? "").trim().toLowerCase());
+    const rows = readResult.rawData || [];
+
+    if (!headers.length || !rows.length) return [];
+
+    const getIdx = (colName) => headers.indexOf(String(colName).trim().toLowerCase());
 
     const catIdx  = getIdx(SYSTEM_CONFIG.LOOKUP.COLS.CATEGORY);
     const codeIdx = getIdx(SYSTEM_CONFIG.LOOKUP.COLS.CODE);
@@ -38,17 +47,21 @@ const CommandEngine = {
     const actIdx  = getIdx(SYSTEM_CONFIG.LOOKUP.COLS.ACTIVE);
     const sepIdx  = getIdx(SYSTEM_CONFIG.LOOKUP.COLS.SEPARATOR);
 
-    if (catIdx === -1 || codeIdx === -1 || descIdx === -1) {
+    // Verify all essential columns exist
+    if (catIdx === -1 || codeIdx === -1 || descIdx === -1 || actIdx === -1) {
       Logger.log(`[CommandEngine] Required columns missing in ${SYSTEM_CONFIG.SHEETS.LOOKUP}`);
       return [];
     }
 
     const commands = [];
-    for (let i = 1; i < table.length; i++) {
-      const row = table[i];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+
+      // Filter by Category ID (Category 5 = System Actions)
       if (Number(row[catIdx]) !== SYSTEM_CONFIG.LOOKUP.CATEGORY_ID) continue;
 
-      const isAct = (row[actIdx] === true || String(row[actIdx]).toUpperCase() === "Y" || row[actIdx] === 1);
+      // Filter: Strictly Is_Active === 'Y'
+      const isAct = String(row[actIdx] ?? "").trim().toUpperCase() === "Y";
       if (!isAct) continue;
 
       const code = String(row[codeIdx] ?? "").trim();
@@ -62,9 +75,14 @@ const CommandEngine = {
         });
       }
     }
+
     return commands;
   },
 
+  /**
+   * Synchronizes data validation dropdown on System_Control sheet.
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss]
+   */
   syncValidation(ss = SpreadsheetApp.getActiveSpreadsheet()) {
     const sheet = ss.getSheetByName(SYSTEM_CONFIG.SHEETS.CONTROL);
     if (!sheet) return;
@@ -92,6 +110,10 @@ const CommandEngine = {
   }
 };
 
+/**
+ * Handles automation dispatch triggered by System_Control dropdown or cell edit.
+ * @param {GoogleAppsScript.Events.SheetsOnEdit} [e]
+ */
 function handleExternalChange(e) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SYSTEM_CONFIG.SHEETS.CONTROL);
@@ -116,28 +138,34 @@ function handleExternalChange(e) {
     throw new Error(`[System_Control] Missing canonical columns in Row 1.`);
   }
 
-  let actionCode = idxCode !== -1 ? String(row[idxCode] ?? "").trim() : "";
   const displayLabel = String(row[idxAction] ?? "").trim();
+  let actionCode = "";
 
-  if (SYSTEM_CONFIG.IDLE_VALUES.has(actionCode)) {
-    if (SYSTEM_CONFIG.IDLE_VALUES.has(displayLabel)) {
-      lock.releaseLock();
-      return;
-    }
+  // Prioritize active selection in dropdown first
+  if (!SYSTEM_CONFIG.IDLE_VALUES.has(displayLabel)) {
     const match = CommandEngine.loadCommands().find(c => c.label.toLowerCase() === displayLabel.toLowerCase());
-    if (!match) {
-      lock.releaseLock();
-      return;
+    if (match) {
+      actionCode = match.code;
     }
-    actionCode = match.code;
-    if (idxCode !== -1) row[idxCode] = actionCode;
   }
+
+  // Fallback to Action Code cell if Action dropdown is idle or manual code was passed
+  if (!actionCode && idxCode !== -1 && !SYSTEM_CONFIG.IDLE_VALUES.has(String(row[idxCode] ?? "").trim())) {
+    actionCode = String(row[idxCode]).trim();
+  }
+
+  if (!actionCode) {
+    lock.releaseLock();
+    return;
+  }
+
+  if (idxCode !== -1) row[idxCode] = actionCode;
 
   const tz = ss.getSpreadsheetTimeZone() || Session.getScriptTimeZone();
   const getTimestamp = () => Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss");
 
   row[idxState] = "Running";
-  row[idxDate] = getTimestamp();
+  row[idxDate]  = getTimestamp();
   row[idxError] = "";
   sheet.getRange(2, 1, 1, numCols).setValues([row]);
   SpreadsheetApp.flush();
@@ -164,6 +192,9 @@ function handleExternalChange(e) {
   }
 }
 
+/**
+ * Standard onOpen trigger initializing the UI menu and data validation.
+ */
 function onOpen() {
   try {
     const ui = SpreadsheetApp.getUi();
@@ -181,6 +212,10 @@ function onOpen() {
   }
 }
 
+/**
+ * Standard onEdit trigger capturing System_Control dropdown selections.
+ * @param {GoogleAppsScript.Events.SheetsOnEdit} e
+ */
 function onEdit(e) {
   if (typeof PivotSortManager !== "undefined" && typeof PivotSortManager.handleEdit === "function") {
     PivotSortManager.handleEdit(e);
@@ -199,23 +234,23 @@ function onEdit(e) {
 }
 
 // ============================================================================
-// 5. CONCISE PUBLIC EXECUTION ENDPOINTS
+// PUBLIC EXECUTION ENDPOINTS (CALLING 100% STATIC ENGINES)
 // ============================================================================
 
 function optimizeAll() {
-  new PortfolioManager().optimizeAll();
+  PortfolioManager.optimizeAll();
 }
 
 function resetAndRecalculateAll() {
-  new PortfolioManager().resetAndRecalculateAll();
+  PortfolioManager.resetAndRecalculateAll();
 }
 
-function sortTransactions() {
-  new PortfolioManager().sortTransactions();
+function optimizeTransactionsAndStocks() {
+  PortfolioManager.optimizeTransactionsAndStocks();
 }
 
 function optimizeGoogleFinance() {
-  new PortfolioManager().optimizeGoogleFinance();
+  PortfolioManager.optimizeGoogleFinance();
 }
 
 function listAllFormulas() {
@@ -242,18 +277,12 @@ function extendFormat(sheet) {
   }
 }
 
-/**
- * Wrapper for WorkbookAuditor formula recovery routine
- */
 function restoreAllFormulas() {
   if (typeof WorkbookAuditor !== "undefined" && typeof WorkbookAuditor.restoreAllFormulas === "function") {
     WorkbookAuditor.restoreAllFormulas();
   }
 }
 
-/**
- * Wrapper for ArrayFormula repair routine
- */
 function fixAllArrayFormulaErrors(target = null) {
   if (typeof WorkbookAuditor !== "undefined" && typeof WorkbookAuditor.fixAllArrayFormulaErrors === "function") {
     WorkbookAuditor.fixAllArrayFormulaErrors(target);

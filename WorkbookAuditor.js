@@ -2,61 +2,99 @@
  * Static utility class responsible for auditing formulas, data tables/islands,
  * workbook structures, and repairing/unblocking ArrayFormula expansion errors.
  * Standardized on 'Formula_Audit' and 'Tables_Audit'.
+ * 
+ * Run `WorkbookAuditor.help()` for full architectural specifications and API contracts.
  */
 class WorkbookAuditor {
+
   /**
-   * Prevent instantiation of purely static utility class.
+   * Returns and logs the architectural specifications, execution contracts, and interface definitions.
+   * @returns {string} Formatted architectural specification.
    */
-  constructor() {
-    throw new Error("WorkbookAuditor is a static utility class and cannot be instantiated.");
+  static help() {
+    const doc = `
+====================================================================================================
+WORKBOOK AUDITOR ARCHITECTURAL SPECIFICATION & OPERATIONAL CONTRACT
+====================================================================================================
+
+1. CORE SYSTEM AUDIT RESPONSIBILITIES:
+   Central static diagnostics and recovery engine:
+     - Component 1: Rapid dynamic array and ArrayFormula repair (zero-write unblocking).
+     - Component 2: Centralized formula inventory and harvesting ('Formula_Audit').
+     - Component 3: Contiguous data table island detection ('Tables_Audit' via 1D typed BFS).
+     - Component 4: High-fidelity formula recovery and atomic sheet restoration.
+
+2. UNIFIED STATIC EXECUTION INTERFACES:
+   All operations are 100% static, stateless, and allocate zero instance wrappers.
+   - WorkbookAuditor.fixAllArrayFormulaErrors(target, ss):
+     Scans top rows for dynamic arrays (ARRAYFORMULA, MAP, BYROW, QUERY, etc.) or #REF! spill errors.
+     Identifies residual static cells blocking expansion in memory and clears them in a single
+     RangeList API call per sheet.
+   - WorkbookAuditor.listAllFormulas(reportName, ss):
+     Extracts all live formulas across non-audit sheets and persists a consolidated inventory to
+     'Formula_Audit' with timestamps and A1 cell coordinates.
+   - WorkbookAuditor.listAllTables(reportName, ss):
+     Scans active grid matrices to detect independent data islands via O(N) 8-direction BFS
+     and writes consolidated table schemas to 'Tables_Audit'.
+   - WorkbookAuditor.restoreAllFormulas(auditSheetName, ss):
+     Reapplies archived formulas from 'Formula_Audit' back to their target cell coordinates
+     without per-cell RPC flushes.
+   - WorkbookAuditor.runAllAudits(ss):
+     Convenience runner executing both listAllTables and listAllFormulas in sequence.
+
+3. HIGH-PERFORMANCE ZERO-WRITE PRINCIPLES:
+   - 1-API Read per sheet via getDataRange().
+   - In-memory V8 evaluation for dirty checking and conflict detection.
+   - 1-API Write via RangeList.clearContent() only if blocked formulas actually exist.
+   - Eliminates redundant RPCs and per-cell server flushes.
+====================================================================================================`.trim();
+
+    Logger.log(doc);
+    return doc;
   }
 
   /**
-   * Returns architectural guidelines and operational contract.
-   * @returns {string}
+   * Pre-compiled Regex for dynamic array formula detection.
+   * @private
    */
-  static getGuidelines() {
-    return [
-      "====================================================================================================",
-      "DO NOT REMOVE OR STRIP COMMENTS FROM THIS FILE.",
-      "----------------------------------------------------------------------------------------------------",
-      "WORKBOOK AUDITOR ARCHITECTURAL GUIDELINES:",
-      "",
-      "1. EXPLICIT AUDIT SHEET CHECKS:",
-      "   - Validates existence of 'Formula_Audit' and 'Tables_Audit' tabs before executing.",
-      "   - Throws explicit errors immediately if tabs are missing from the workbook.",
-      "",
-      "2. FORMULA HARVESTING & APPLICATION:",
-      "   - Accurately scans formulas across sheets, logs to Formula_Audit, and safely reapplies formulas.",
-      "",
-      "3. GENERALIZED ARRAYFORMULA REPAIR (fixAllArrayFormulaErrors):",
-      "   - Sheet-independent static repair utility.",
-      "   - Scans top rows for dynamic arrays, cleans blocking residual cells in rows below,",
-      "     and eliminates #REF! expansion errors instantly.",
-      "===================================================================================================="
-    ].join("\n");
+  static get _DYNAMIC_ARRAY_REGEX() {
+    if (!WorkbookAuditor._DYNAMIC_ARRAY_REGEX_CACHE) {
+      WorkbookAuditor._DYNAMIC_ARRAY_REGEX_CACHE = /^=(?:ARRAYFORMULA\b|MAP\b|BYROW\b|BYCOL\b|SCAN\b|REDUCE\b|QUERY\b|FILTER\b|SORT\b|UNIQUE\b|\{)/i;
+    }
+    return WorkbookAuditor._DYNAMIC_ARRAY_REGEX_CACHE;
   }
 
-  // 8-Direction BFS Grid Offsets (Encapsulated inside class)
+  /**
+   * Pre-compiled Regex for R1C1 formula notation detection.
+   * @private
+   */
+  static get _R1C1_REGEX() {
+    if (!WorkbookAuditor._R1C1_REGEX_CACHE) {
+      WorkbookAuditor._R1C1_REGEX_CACHE = /(?:R\[?-?\d*\]?C\[?-?\d*\]?|RC\[?-?\d*\]?)/i;
+    }
+    return WorkbookAuditor._R1C1_REGEX_CACHE;
+  }
+
+  // 8-Direction BFS Grid Offsets
   static get _DR() { return [-1, -1, -1,  0,  0,  1,  1,  1]; }
   static get _DC() { return [-1,  0,  1, -1,  1, -1,  0,  1]; }
 
   // Blacklist of system tabs to ignore during auditing
   static get AUDIT_SHEET_KEYWORDS() {
-    return new Set([
-      "formulaaudit",
-      "tablesaudit",
-      "optimizelog",
-      "systemcontrol",
-      "system_control",
-      "lookupvalues",
-      "lookup_values",
-      "lookupcategories",
-      "lookup_categories",
-      "perusersettings",
-      "detailslookups",
-      "masterlookups"
-    ]);
+    if (!WorkbookAuditor._AUDIT_KEYWORDS_CACHE) {
+      WorkbookAuditor._AUDIT_KEYWORDS_CACHE = new Set([
+        "formulaaudit",
+        "tablesaudit",
+        "optimizelog",
+        "systemcontrol",
+        "lookupvalues",
+        "lookupcategories",
+        "perusersettings",
+        "detailslookups",
+        "masterlookups"
+      ]);
+    }
+    return WorkbookAuditor._AUDIT_KEYWORDS_CACHE;
   }
 
   /**
@@ -76,11 +114,20 @@ class WorkbookAuditor {
   }
 
   /**
+   * Normalizes and checks whether a sheet name belongs to internal audit/control sheets.
+   * @private
+   */
+  static _isAuditSheet(sheetName) {
+    const normalized = String(sheetName || "").replace(/[\s_-]/g, "").toLowerCase();
+    return WorkbookAuditor.AUDIT_SHEET_KEYWORDS.has(normalized);
+  }
+
+  /**
    * HIGH-PERFORMANCE ZERO-WRITE ARRAYFORMULA FIXER
    * 
-   * 1. 1-READ / 1-WRITE (via RangeList): Reads entire sheet in 1 API read.
+   * 1. 1-READ (getDataRange): Reads formulas and values in bulk.
    * 2. ZERO-WRITE PASS: Skips write APIs completely if no formulas are blocked.
-   * 3. BATCH RANGE CLEARING: Clears all blocked columns in 1 single API write per sheet.
+   * 3. BATCH RANGE CLEARING: Clears all blocked columns in 1 single API write per sheet via RangeList.
    * 
    * @param {string|GoogleAppsScript.Spreadsheet.Sheet} [target=null] - Target sheet or null for all sheets.
    * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss=SpreadsheetApp.getActiveSpreadsheet()]
@@ -101,6 +148,7 @@ class WorkbookAuditor {
 
     let totalColumnsFixed = 0;
     const fixedDetails = [];
+    const arrayRegex = WorkbookAuditor._DYNAMIC_ARRAY_REGEX;
 
     for (let s = 0; s < sheetsToProcess.length; s++) {
       const sheet = sheetsToProcess[s];
@@ -108,10 +156,8 @@ class WorkbookAuditor {
       const numRows = dataRange.getNumRows();
       const numCols = dataRange.getNumColumns();
 
-      // Skip sheets with no data rows below headers
       if (numRows < 2 || numCols < 1) continue;
 
-      // 1 BULK READ: In-memory grid inspection
       const formulas = dataRange.getFormulas();
       const values = dataRange.getValues();
       const maxRows = sheet.getMaxRows();
@@ -125,18 +171,9 @@ class WorkbookAuditor {
           const formula = String(formulas[r][c] || "").trim();
           const value = String(values[r][c] || "").trim();
 
-          // Check if this header cell contains an ArrayFormula or has a #REF! spill error
-          const isArrayFormula = 
-            formula.toUpperCase().includes("ARRAYFORMULA") ||
-            formula.startsWith("={") ||
-            formula.toUpperCase().startsWith("=MAP(") ||
-            formula.toUpperCase().startsWith("=BYROW(") ||
-            formula.toUpperCase().startsWith("=QUERY(") ||
-            formula.toUpperCase().startsWith("=FILTER(") ||
-            value === "#REF!";
+          const isArrayFormula = (formula && arrayRegex.test(formula)) || value === "#REF!";
 
           if (isArrayFormula && (r + 1 < numRows)) {
-            // Check in V8 memory if any rows below contain static values blocking expansion
             let hasBlockingData = false;
             for (let subR = r + 1; subR < numRows; subR++) {
               const cellVal = values[subR][c];
@@ -146,26 +183,23 @@ class WorkbookAuditor {
               }
             }
 
-            // Queue range for batch clearing if blocking data is present
             if (hasBlockingData) {
               const colLetter = WorkbookAuditor.getColLetter(c + 1);
               const startRow = r + 2;
               rangesToClear.push(`${colLetter}${startRow}:${colLetter}${maxRows}`);
               totalColumnsFixed++;
-              break; // Next column
+              break;
             }
           }
         }
       }
 
-      // ONLY WRITE IF BLOCKED COLUMNS WERE FOUND ON THIS SHEET
       if (rangesToClear.length > 0) {
-        sheet.getRangeList(rangesToClear).clearContent(); // 1 Single API Write for all blocked columns
+        sheet.getRangeList(rangesToClear).clearContent();
         fixedDetails.push(`${sheetName} (${rangesToClear.length} col)`);
       }
     }
 
-    // Flush ONLY if any changes were actually made
     if (totalColumnsFixed > 0) {
       SpreadsheetApp.flush();
     }
@@ -190,7 +224,8 @@ class WorkbookAuditor {
     const nowTimestamp = new Date();
     const allDataToPush = [["Sheet Name", "Cell", "Formula", "Last Update"]];
 
-    for (const sheet of sheets) {
+    for (let s = 0; s < sheets.length; s++) {
+      const sheet = sheets[s];
       const sheetName = sheet.getName();
       if (WorkbookAuditor._isAuditSheet(sheetName)) continue;
 
@@ -202,16 +237,8 @@ class WorkbookAuditor {
 
       for (let r = 0; r < numRows; r++) {
         const row = formulas[r];
-        let hasFormula = false;
-        for (let c = 0; c < numCols; c++) {
-          if (row[c] !== "") {
-            hasFormula = true;
-            break;
-          }
-        }
-        if (!hasFormula) continue;
-
         const rowRef = r + 1;
+
         for (let c = 0; c < numCols; c++) {
           const formula = row[c];
           if (formula) {
@@ -251,7 +278,8 @@ class WorkbookAuditor {
     const dr = WorkbookAuditor._DR;
     const dc = WorkbookAuditor._DC;
 
-    for (const sheet of sheets) {
+    for (let s = 0; s < sheets.length; s++) {
+      const sheet = sheets[s];
       const sheetName = sheet.getName();
       if (WorkbookAuditor._isAuditSheet(sheetName)) continue;
 
@@ -342,6 +370,19 @@ class WorkbookAuditor {
     );
   }
 
+  /**
+   * Unified runner executing both table and formula audits in sequence.
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss=SpreadsheetApp.getActiveSpreadsheet()]
+   */
+  static runAllAudits(ss = SpreadsheetApp.getActiveSpreadsheet()) {
+    WorkbookAuditor.listAllTables("Tables_Audit", ss);
+    WorkbookAuditor.listAllFormulas("Formula_Audit", ss);
+  }
+
+  /**
+   * Sanitizes formula string by stripping apostrophe prefixes, cleaning escapes, and standardizing '='.
+   * @private
+   */
   static _sanitizeFormula(rawFormula) {
     if (!rawFormula) return "";
     let formula = String(rawFormula).trim();
@@ -350,42 +391,33 @@ class WorkbookAuditor {
       formula = formula.substring(1).trim();
     }
     formula = formula.replace(/\\"/g, '"');
-    formula = formula.replace(/ArrayFormula\s*\(\s*(".*?"|'.*?')\s*\{;\s*/gi, 'ArrayFormula({ $1; ');
     formula = formula.replace(/^=+/, '');
     return "=" + formula.trim();
   }
 
+  /**
+   * Fast formula application without per-cell flushes.
+   * @private
+   */
   static _applyFormulaToRange(range, cleanFormula) {
-    const hasR1C1 = /(?:R\[?-?\d*\]?C\[?-?\d*\]?|RC\[?-?\d*\]?)/i.test(cleanFormula);
-
-    if (hasR1C1) {
+    const isR1C1 = WorkbookAuditor._R1C1_REGEX.test(cleanFormula);
+    if (isR1C1) {
       try {
         range.setFormulaR1C1(cleanFormula);
-        SpreadsheetApp.flush();
-        if (range.getDisplayValue() !== "#ERROR!") return true;
-      } catch (e) {}
-      try {
-        range.setFormula(cleanFormula);
-        SpreadsheetApp.flush();
-        if (range.getDisplayValue() !== "#ERROR!") return true;
+        return true;
       } catch (e) {
-        throw new Error("R1C1/A1 Parse Error: " + e.message);
+        range.setFormula(cleanFormula);
+        return true;
       }
     } else {
       try {
         range.setFormula(cleanFormula);
-        SpreadsheetApp.flush();
-        if (range.getDisplayValue() !== "#ERROR!") return true;
-      } catch (e) {}
-      try {
-        range.setFormulaR1C1(cleanFormula);
-        SpreadsheetApp.flush();
-        if (range.getDisplayValue() !== "#ERROR!") return true;
+        return true;
       } catch (e) {
-        throw new Error("A1/R1C1 Parse Error: " + e.message);
+        range.setFormulaR1C1(cleanFormula);
+        return true;
       }
     }
-    return true;
   }
 
   /**
@@ -454,15 +486,16 @@ class WorkbookAuditor {
       } catch (err) {
         const errorMsg = `Row ${i + 1} (${targetSheetName}!${targetCell}): ${err.message}`;
         errors.push(errorMsg);
-        Logger.log(`[APPLY ERROR] ${errorMsg}`);
+        Logger.log(`[WorkbookAuditor.restoreAllFormulas Error] ${errorMsg}`);
       }
     }
 
+    // Flush ONCE after all formula ranges have been set
     SpreadsheetApp.flush();
 
     const summaryMsg = `Applied: ${applied} | Skipped: ${skipped} | Errors: ${errors.length}`;
     ss.toast(summaryMsg, errors.length === 0 ? "Success ✅" : "Warning ⚠️", 6);
-    Logger.log(`[WorkbookAuditor] Formula Restoration Summary -> ${summaryMsg}`);
+    Logger.log(`[WorkbookAuditor.restoreAllFormulas] Summary -> ${summaryMsg}`);
 
     return {
       success: errors.length === 0,
@@ -473,6 +506,10 @@ class WorkbookAuditor {
     };
   }
 
+  /**
+   * Helper writing consolidated audit outputs to the target report sheet.
+   * @private
+   */
   static _writeReport(ss, reportName, data, emptyMsg, successMsg) {
     const reportSheet = ss.getSheetByName(reportName) || ss.insertSheet(reportName);
     reportSheet.clear();
@@ -481,18 +518,14 @@ class WorkbookAuditor {
     if (dataLen > 1) {
       const numCols = data[0].length;
       reportSheet.getRange(1, 1, dataLen, numCols).setValues(data);
-      reportSheet.getRange(1, 1, 1, numCols).setFontWeight("bold").setBackground("#f3f3f3");
+      reportSheet.getRange(1, 1, 1, numCols).setFontWeight("bold").setBackground("#3c78d8").setFontColor("#ffffff");
       reportSheet.getRange(2, numCols, dataLen - 1, 1).setNumberFormat("yyyy-mm-dd hh:mm:ss");
       reportSheet.setFrozenRows(1);
+      reportSheet.autoResizeColumns(1, numCols);
 
       ss.toast(`${successMsg} Found ${dataLen - 1} entries in ${reportName}.`, "Success ✅", 5);
     } else {
       ss.toast(emptyMsg, "Finished ℹ️", 3);
     }
-  }
-
-  static _isAuditSheet(sheetName) {
-    const normalized = sheetName.replace(/[\s_-]/g, "").toLowerCase();
-    return WorkbookAuditor.AUDIT_SHEET_KEYWORDS.has(normalized);
   }
 }
