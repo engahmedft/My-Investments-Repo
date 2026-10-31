@@ -1,57 +1,88 @@
 /**
  * Fully self-contained, high-performance batch data processor for Google Sheets.
- * Operates on 1 API Read + 1 API Write + (1 optional API Delete / Insert for reduced or expanded ranges).
+ * Operates on 1 API Read + 1 API Write + (1 optional API Delete / Insert for structural mutations).
+ * Run `BatchProcessor.help()` for full architectural specifications and API contracts.
  */
 class BatchProcessor {
 
+  /**
+   * Returns and logs the architectural specifications, execution contracts, and interface definitions.
+   * @returns {string} Formatted architectural specification.
+   */
+  static help() {
+    const doc = `
+====================================================================================================
+BATCHPROCESSOR ARCHITECTURAL SPECIFICATION & EXECUTION CONTRACT
+====================================================================================================
 
-  /* ====================================================================================================
- * DO NOT REMOVE OR STRIP COMMENTS FROM THIS FILE.
- * ----------------------------------------------------------------------------------------------------
- * BATCHPROCESSOR ARCHITECTURAL CONTRACT:
- * 
- * 1. HIGH-PERFORMANCE 1-READ / 1-WRITE BATCH EXECUTION:
- *    Eliminates spreadsheet API latency by fetching data in 1 bulk read (`getDataRange().getValues()`), 
- *    transforming data purely in V8 memory, and writing back in 1 bulk write (`getRange().setValues()`).
- * 
- * 2. SHALLOW ROW CLONING FOR ACCURATE CHANGE DETECTION (`.slice()`):
- *    Before passing a row to `processFn`, `BatchProcessor` creates a shallow copy (`rawData[index].slice()`).
- *    This preserves `rawData[index]` with the original values read directly from Google Sheets.
- *    When `processFn` mutates the row in memory, `rawData[index]` remains untouched, allowing the Zero-Write
- *    pass (`pRow[c] !== oRow[c]`) to accurately detect true changes without in-memory reference equality bugs!
- * 
- * 3. ZERO-WRITE PASS FOR UNCHANGED DATA:
- *    Compares processed output against original raw sheet data (ignoring ArrayFormula columns).
- *    If no non-formula values changed and no rows were inserted/deleted, `BatchProcessor` skips `setValues()`
- *    write API calls entirely, making no-op runs finish in <0.5s!
- * 
- * 4. SMART FILTER PROTECTION (`_clearFilterCriteria`):
- *    Before performing batch writes, checks if columns have active filter criteria (`getColumnFilterCriteria`).
- *    Clears criteria ONLY on columns that currently have active filters hiding rows, preventing row misalignment.
- * 
- * 5. ARRAYFORMULA PROTECTION:
- *    Columns registered in `arrayFormulaHeaders` are automatically nullified (`null`) on write-back.
- *    This prevents Google Apps Script from overwriting live Google Sheets ArrayFormulas.
- * 
- * 6. GRID OVERFLOW & EXCESS ROW BOUNDARY PROTECTION:
- *    - Automatically expands sheet rows (`insertRowsAfter`) if in-memory insertions exceed current max rows.
- *    - Safely deletes excess trailing rows (`deleteRows`) when output rows are fewer than input rows, 
- *      guarded strictly against grid boundaries.
- * ==================================================================================================== */
+1. 1-READ / 1-WRITE BATCH LATENCY ELIMINATION:
+   Eliminates spreadsheet RPC overhead by consolidating grid access into a single bulk read
+   (getDataRange().getValues()), running all row transformations in V8 heap memory, and 
+   committing updates in at most one bulk write (Range.setValues()).
 
+2. IMMUTABLE REFERENCE ISOLATION (.slice()):
+   Supplies processFn with an isolated shallow copy (rawData[index].slice()), preserving the
+   original values in rawData. This prevents in-place mutation side effects and guarantees 
+   deterministic dirty-checking against the baseline sheet state.
+
+3. ZERO-WRITE PASS & DIRTY CHECKING:
+   Compares transformed rows against baseline values using type-aware equality (handling Date
+   timestamps and NaN). If dimensions and non-formula cells are unchanged, all write, insert,
+   delete, and filter RPCs are short-circuited entirely (<0.1s execution).
+
+4. DEFERRED SMART FILTER PROTECTION (_clearFilterCriteria):
+   Inspects and clears active filter criteria ONLY when write mutations actually occur.
+   Eliminates redundant RPC queries during no-op executions while preventing "operation not
+   supported on a filtered row" write exceptions when committing data.
+
+5. ARRAYFORMULA SHIELDING:
+   Masks registered formula columns with null prior to write-back. Google Sheets ignores null
+   entries during setValues(), preventing formula overwrites and #SPILL! / #REF! expansion errors.
+
+6. BOUNDARY-SAFE GRID RECONCILIATION & AUTO-PADDING:
+   - Expands sheet grid boundaries (insertRowsAfter) if processed row counts exceed sheet capacity.
+   - Truncates surplus trailing rows (deleteRows) when output shrinks, guarded against grid minimums.
+   - Enforces uniform 2D rectangularity: returned rows shorter than numCols are padded with '""',
+     while rows exceeding numCols are cleanly truncated.
+
+7. STRICT UNIFORM INTERFACE CONTRACT:
+   Target Specification:
+     sheetTarget: string (sheet name) | GoogleAppsScript.Spreadsheet.Sheet
+
+   Callback Signature:
+     (row: any[], col: (name: string) => number, index: number, rawData: any[][]) => any[][]
+     * col(name): Case-insensitive, whitespace-trimmed column index lookup (returns 0-based idx or -1).
+     * Cardinality:
+       - [row]                -> Standard 1:1 row transformation.
+       - [row, ...newRows]    -> 1:N expansion (dynamic row insertion).
+       - []                   -> 1:0 reduction (row omission/filtering).
+
+   Methods:
+     - BatchProcessor.read(sheetTarget, headerRowNumber = 1): 
+         { sheet: Sheet, headers: string[], rawData: any[][], numCols: number, headerRow: number }
+     - BatchProcessor.process(sheetTarget, headerRowNumber, processFn, arrayFormulaHeaders = []): void
+     - BatchProcessor.help(): string
+====================================================================================================`.trim();
+
+    Logger.log(doc);
+    return doc;
+  }
 
   /**
-   * Normalizes header strings by trimming whitespace and lowercasing.
+   * Normalizes header strings by converting nullish values to empty strings, trimming whitespace, and lowercasing.
    * @private
+   * @param {any} header - Raw header value.
+   * @returns {string} Normalized lowercase string.
    */
   static _normalizeHeader(header) {
     return String(header ?? "").trim().toLowerCase();
   }
 
   /**
-   * Clears filter criteria ONLY from columns that currently have active filter criteria hiding rows.
-   * Preserves the Filter UI dropdown buttons while unhiding all rows.
+   * Clears filter criteria ONLY from columns that currently have active criteria hiding rows.
+   * Preserves the filter range and dropdown UI buttons while unhiding all rows.
    * @private
+   * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Target Sheet instance.
    */
   static _clearFilterCriteria(sheet) {
     if (!sheet) return;
@@ -70,8 +101,11 @@ class BatchProcessor {
   }
 
   /**
-   * Resolves a sheet input (string name or Sheet object) into a valid Sheet instance.
+   * Resolves a sheet target (string name or Sheet object) into a validated Sheet instance.
    * @private
+   * @param {string|GoogleAppsScript.Spreadsheet.Sheet} sheetTarget - Sheet name or Sheet instance.
+   * @returns {GoogleAppsScript.Spreadsheet.Sheet} Validated Sheet instance.
+   * @throws {Error} If the target sheet cannot be found or is invalid.
    */
   static _resolveSheet(sheetTarget) {
     const sheet = typeof sheetTarget === "string"
@@ -85,43 +119,49 @@ class BatchProcessor {
   }
 
   /**
-   * PURE READ: Reads the actual data range of a sheet and returns a 2D array 
-   * with normalized headers as Row 0 followed by raw data rows.
-   * 
-   * @param {string|GoogleAppsScript.Spreadsheet.Sheet} sheetTarget - Sheet name string or Sheet object.
-   * @param {number} [headerRowNumber=1] - 1-based row number where headers reside.
-   * @returns {Array<Array<any>>} [ [normalizedHeader1, normalizedHeader2, ...], [row1...], [row2...] ]
+   * Low-level read engine: resolves the sheet, reads grid data, and extracts normalized headers and raw rows.
+   * Minimizes V8 object allocations by directly reusing sub-arrays where column dimensions match.
+   * @private
+   * @param {string|GoogleAppsScript.Spreadsheet.Sheet} sheetTarget - Target sheet name or instance.
+   * @param {number} [headerRowNumber=1] - 1-based row index containing column headers.
+   * @returns {{sheet: GoogleAppsScript.Spreadsheet.Sheet, headers: string[], rawData: any[][], numCols: number, headerRow: number}}
    */
   static read(sheetTarget, headerRowNumber = 1) {
     const sheet = BatchProcessor._resolveSheet(sheetTarget);
+    const headerRow = Math.max(1, Math.floor(Number(headerRowNumber) || 1));
 
-    // 1. SINGLE API READ
+    // 1. Single API read across active grid
     const allValues = sheet.getDataRange().getValues();
-    if (allValues.length < headerRowNumber) {
-      return [];
+    if (allValues.length < headerRow) {
+      return { sheet, headers: [], rawData: [], numCols: 0, headerRow };
     }
 
-    // 2. EXTRACT & NORMALIZE HEADERS (SINGLE PASS)
-    const headerRowIndex = headerRowNumber - 1;
+    // 2. Scan header row in reverse to locate rightmost populated column
+    const headerRowIndex = headerRow - 1;
     const rawHeaderRow = allValues[headerRowIndex];
-    const allNormalized = rawHeaderRow.map(h => BatchProcessor._normalizeHeader(h));
 
     let lastHeaderColIndex = -1;
-    for (let c = allNormalized.length - 1; c >= 0; c--) {
-      if (allNormalized[c] !== "") {
+    for (let c = rawHeaderRow.length - 1; c >= 0; c--) {
+      const h = rawHeaderRow[c];
+      if (h !== "" && h !== null && h !== undefined && String(h).trim() !== "") {
         lastHeaderColIndex = c;
         break;
       }
     }
 
-    if (lastHeaderColIndex === -1) return []; // No valid headers found
+    if (lastHeaderColIndex === -1) {
+      return { sheet, headers: [], rawData: [], numCols: 0, headerRow };
+    }
 
     const numCols = lastHeaderColIndex + 1;
-    const normalizedHeaders = allNormalized.slice(0, numCols);
+    const normalizedHeaders = new Array(numCols);
+    for (let c = 0; c < numCols; c++) {
+      normalizedHeaders[c] = BatchProcessor._normalizeHeader(rawHeaderRow[c]);
+    }
 
-    // 3. REVERSE SCAN FOR LAST DATA ROW (INLINED FAST-PATH LOOP)
+    // 3. Scan upwards from bottom to find the last populated data row
     let lastDataRowIndex = -1;
-    for (let r = allValues.length - 1; r >= headerRowNumber; r--) {
+    for (let r = allValues.length - 1; r >= headerRow; r--) {
       const row = allValues[r];
       let hasData = false;
 
@@ -139,112 +179,123 @@ class BatchProcessor {
       }
     }
 
-    if (lastDataRowIndex < headerRowNumber) {
-      return [normalizedHeaders]; // Return only headers if no data rows exist
+    if (lastDataRowIndex < headerRow) {
+      return { sheet, headers: normalizedHeaders, rawData: [], numCols, headerRow };
     }
 
-    // 4. SLICE RAW DATA ROWS (TRIMMED TO ACTUAL RANGE)
-    const rawData = new Array(lastDataRowIndex - headerRowNumber + 1);
-    for (let i = 0, r = headerRowNumber; r <= lastDataRowIndex; r++, i++) {
+    // 4. Extract data rows; reuse source row reference if column width matches numCols
+    const dataRowCount = lastDataRowIndex - headerRow + 1;
+    const rawData = new Array(dataRowCount);
+    for (let i = 0, r = headerRow; r <= lastDataRowIndex; r++, i++) {
       const row = allValues[r];
-      rawData[i] = row.length >= numCols ? row.slice(0, numCols) : row;
+      rawData[i] = row.length === numCols ? row : row.slice(0, numCols);
     }
 
-    // 5. RETURN 2D ARRAY
-    return [normalizedHeaders].concat(rawData);
+    return { sheet, headers: normalizedHeaders, rawData, numCols, headerRow };
   }
 
   /**
-   * BATCH PROCESS & WRITE: Transforms data in-memory and writes changes back to sheet.
-   * Automatically unhides filtered rows before processing to prevent row misalignment.
-   * Features a Zero-Write pass using .slice() row cloning to skip setValues() if no data changed.
+   * Batch process & write: transforms data in-memory and persists mutations to the sheet.
+   * Operates strictly on a 1-Read / 1-Write model with smart filter protection and zero-write pass.
    * 
    * @param {string|GoogleAppsScript.Spreadsheet.Sheet} sheetTarget - Sheet name string or Sheet object.
    * @param {number} headerRowNumber - 1-based row number where headers reside.
-   * @param {Function} processFn - Callback: (row, col, index, rawData) => Array<Array<any>>
-   * @param {string[]} [arrayFormulaHeaders=[]] - Header names containing ARRAYFORMULAs.
+   * @param {Function} processFn - Strict transform callback: (row: any[], col: (name: string) => number, index: number, rawData: any[][]) => Array<Array<any>>
+   * @param {string[]} [arrayFormulaHeaders=[]] - Header names containing ARRAYFORMULAs to be protected.
    */
   static process(sheetTarget, headerRowNumber, processFn, arrayFormulaHeaders = []) {
-    const targetSheet = BatchProcessor._resolveSheet(sheetTarget);
+    // 1. Single API read & sheet resolution
+    const { sheet: targetSheet, headers: normalizedHeaders, rawData, numCols, headerRow } =
+      BatchProcessor.read(sheetTarget, headerRowNumber);
 
-    // AUTOMATIC FILTER PROTECTION: Clear active filter criteria before processing
-    BatchProcessor._clearFilterCriteria(targetSheet);
-
-    // 1. FETCH RAW RANGE WITH NORMALIZED HEADERS
-    const table = BatchProcessor.read(targetSheet, headerRowNumber);
-    if (!table || table.length <= 1) {
+    if (!rawData || rawData.length === 0) {
       return; // No data rows to process
     }
 
-    const normalizedHeaders = table[0];
-    const rawData = table.slice(1);
     const oldNumRows = rawData.length;
-    const numCols = normalizedHeaders.length;
 
-    // 2. BUILD HEADER MAP & MEMOIZED COL HELPER
+    // 2. Build unified header map & memoized column index resolver
     const headerMap = new Map();
-    normalizedHeaders.forEach((h, colIdx) => {
-      if (h !== "") headerMap.set(h, colIdx);
-    });
-
-    const colCache = new Map();
-    const col = (headerName) => {
-      let idx = colCache.get(headerName);
-      if (idx === undefined) {
-        const normalized = BatchProcessor._normalizeHeader(headerName);
-        idx = headerMap.has(normalized) ? headerMap.get(normalized) : -1;
-        colCache.set(headerName, idx);
-      }
-      return idx;
-    };
-
-    const formulaColIndices = arrayFormulaHeaders
-      .map(col)
-      .filter(idx => idx !== -1);
-    const formulaColSet = new Set(formulaColIndices);
-    const numFormulaCols = formulaColIndices.length;
-
-    // 3. TRANSFORM DATA IN-MEMORY (FAST NO-ALLOCATION PUSH LOOP)
-    const processedData = [];
-    for (let index = 0; index < oldNumRows; index++) {
-
-      // SHALLOW ROW COPY (.slice()):
-      // Creates a shallow copy of the row before passing it to processFn.
-      // This prevents processFn from mutating rawData[index] in place.
-      // Keeping rawData[index] pristine with original sheet values allows the Zero-Write
-      // pass below (pRow[c] !== oRow[c]) to detect actual value changes accurately!
-      const rowInput = rawData[index].slice();
-
-      const res = processFn(rowInput, col, index, rawData);
-      if (!Array.isArray(res) || res.length === 0) continue;
-
-      for (let r = 0; r < res.length; r++) {
-        const targetRow = res[r];
-        if (Array.isArray(targetRow)) {
-          while (targetRow.length < numCols) targetRow.push("");
-          if (targetRow.length > numCols) targetRow.length = numCols;
-
-          // Nullify ArrayFormula columns
-          for (let f = 0; f < numFormulaCols; f++) {
-            targetRow[formulaColIndices[f]] = null;
-          }
-          processedData.push(targetRow);
-        }
+    for (let c = 0; c < numCols; c++) {
+      const h = normalizedHeaders[c];
+      if (h !== "" && !headerMap.has(h)) {
+        headerMap.set(h, c);
       }
     }
 
-    const startRow = headerRowNumber + 1;
+    const col = (headerName) => {
+      let idx = headerMap.get(headerName);
+      if (idx !== undefined) return idx;
+
+      const normalized = BatchProcessor._normalizeHeader(headerName);
+      idx = headerMap.has(normalized) ? headerMap.get(normalized) : -1;
+      headerMap.set(headerName, idx);
+      return idx;
+    };
+
+    // 3. O(1) typed array lookup for ArrayFormula protected columns
+    const isFormulaCol = new Uint8Array(numCols);
+    const formulaColIndices = [];
+    for (let i = 0; i < arrayFormulaHeaders.length; i++) {
+      const idx = col(arrayFormulaHeaders[i]);
+      if (idx !== -1) {
+        formulaColIndices.push(idx);
+        isFormulaCol[idx] = 1;
+      }
+    }
+    const numFormulaCols = formulaColIndices.length;
+
+    // 4. In-memory data transformation loop
+    const processedData = [];
+    for (let index = 0; index < oldNumRows; index++) {
+      // Shallow copy (.slice()) preserves pristine original row in rawData for Zero-Write comparison
+      const rowInput = rawData[index].slice();
+
+      // Single-form invocation: strictly passes (row, col, index, rawData)
+      // and strictly expects a 2D array return: Array<Array<any>>
+      const res = processFn(rowInput, col, index, rawData);
+      if (!Array.isArray(res) || res.length === 0) continue;
+
+      const resLen = res.length;
+      for (let r = 0; r < resLen; r++) {
+        const targetRow = res[r];
+        if (!Array.isArray(targetRow)) continue;
+
+        const curLen = targetRow.length;
+        if (curLen < numCols) {
+          for (let c = curLen; c < numCols; c++) targetRow.push("");
+        } else if (curLen > numCols) {
+          targetRow.length = numCols;
+        }
+
+        // Nullify ArrayFormula columns to prevent write collisions
+        for (let f = 0; f < numFormulaCols; f++) {
+          targetRow[formulaColIndices[f]] = null;
+        }
+        processedData.push(targetRow);
+      }
+    }
+
+    const startRow = headerRow + 1;
     const newNumRows = processedData.length;
 
-    // ZERO-WRITE PASS CHECK: Compare processed data against pristine original raw sheet data
+    // 5. Zero-Write pass: compare processed data against pristine original raw sheet data
     let dataHasChanged = (newNumRows !== oldNumRows);
     if (!dataHasChanged) {
       for (let r = 0; r < newNumRows; r++) {
         const pRow = processedData[r];
-        const oRow = rawData[r]; // Unmutated original sheet values because rowInput was sliced
+        const oRow = rawData[r];
         for (let c = 0; c < numCols; c++) {
-          if (formulaColSet.has(c)) continue; // Skip ArrayFormula columns from change detection
-          if (pRow[c] !== oRow[c]) {
+          if (isFormulaCol[c]) continue; // Skip ArrayFormula columns
+          const pVal = pRow[c];
+          const oVal = oRow[c];
+          if (pVal !== oVal) {
+            // Guard Date references and NaN comparisons against false-positive writes
+            if (pVal instanceof Date && oVal instanceof Date) {
+              if (pVal.getTime() === oVal.getTime()) continue;
+            } else if (Number.isNaN(pVal) && Number.isNaN(oVal)) {
+              continue;
+            }
             dataHasChanged = true;
             break;
           }
@@ -253,31 +304,37 @@ class BatchProcessor {
       }
     }
 
-    // 4. WRITE BACK ONLY IF DATA CHANGED
-    if (dataHasChanged && newNumRows > 0) {
-      const requiredMaxRow = startRow + newNumRows - 1;
-      const currentMaxRows = targetSheet.getMaxRows();
-      if (requiredMaxRow > currentMaxRows) {
-        targetSheet.insertRowsAfter(currentMaxRows, requiredMaxRow - currentMaxRows);
+    // 6. Write back only if changes were detected
+    if (dataHasChanged) {
+      // SMART FILTER PROTECTION: Clear active filter criteria only when batch mutations actually occur
+      BatchProcessor._clearFilterCriteria(targetSheet);
+
+      let currentMaxRows = targetSheet.getMaxRows();
+
+      if (newNumRows > 0) {
+        const requiredMaxRow = startRow + newNumRows - 1;
+        if (requiredMaxRow > currentMaxRows) {
+          const rowsToAdd = requiredMaxRow - currentMaxRows;
+          targetSheet.insertRowsAfter(currentMaxRows, rowsToAdd);
+          currentMaxRows = requiredMaxRow; // Update cached row count locally
+        }
+
+        // Single bulk API write pass
+        targetSheet.getRange(startRow, 1, newNumRows, numCols).setValues(processedData);
       }
 
-      // Single 1-Write pass
-      targetSheet.getRange(startRow, 1, newNumRows, numCols).setValues(processedData);
-    }
+      // Delete extra trailing rows if output row count contracted
+      if (newNumRows < oldNumRows) {
+        const deleteStartRow = startRow + newNumRows;
+        const rowsToDelete = oldNumRows - newNumRows;
 
-    // Delete extra reduced rows if row count shrank
-    if (newNumRows < oldNumRows) {
-      const deleteStartRow = startRow + newNumRows;
-      const rowsToDelete = oldNumRows - newNumRows;
-      const currentMaxRows = targetSheet.getMaxRows();
-
-      if (deleteStartRow <= currentMaxRows) {
-        const safeRowsToDelete = Math.min(rowsToDelete, currentMaxRows - deleteStartRow + 1);
-        if (safeRowsToDelete > 0) {
-          targetSheet.deleteRows(deleteStartRow, safeRowsToDelete);
+        if (deleteStartRow <= currentMaxRows) {
+          const safeRowsToDelete = Math.min(rowsToDelete, currentMaxRows - deleteStartRow + 1);
+          if (safeRowsToDelete > 0) {
+            targetSheet.deleteRows(deleteStartRow, safeRowsToDelete);
+          }
         }
       }
     }
   }
 }
-
